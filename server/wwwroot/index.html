@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clicker</title>
+<style>
+  :root { --bg:#fff; --fg:#111; --muted:#666; --card:#f1f1f1; --ok:#1a7f37; --bad:#c62828; --fill:#bbdefb; --fill-over:#ffcdd2; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111; --fg:#eee; --muted:#999; --card:#222; --ok:#4cc26a; --bad:#ff6b6b; --fill:#1e3a5f; --fill-over:#5c2323; } }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:16px system-ui, sans-serif; }
+  .row { display:flex; gap:12px; margin:12px 0; }
+  .card { background:var(--card); border-radius:12px; padding:12px; flex:1; }
+  .label { color:var(--muted); font-size:13px; }
+  .progress { position:relative; overflow:hidden; }
+  .progress .fill { position:absolute; inset:0 auto 0 0; width:0; background:var(--fill); transition:width .25s linear, background-color .25s; }
+  .progress.over .fill { background:var(--fill-over); }
+  .progress .content { position:relative; }
+  .big { font-size:34px; font-variant-numeric:tabular-nums; }
+  button { flex:1; font-size:22px; padding:28px 0; border:0; border-radius:12px; background:var(--card); color:var(--fg); }
+  button.primary { background:#1565c0; color:#fff; }
+  .bad { color:var(--bad); } .ok { color:var(--ok); }
+  pre { white-space:pre-wrap; background:var(--card); border-radius:12px; padding:12px; }
+</style>
+</head>
+<body>
+<div id="status" class="label">Conectando…</div>
+<h2 id="title">—</h2>
+<div class="row">
+  <div class="card"><div class="label">Diapositiva</div><div class="big" id="slide">–</div></div>
+  <div class="card progress" id="slideCard">
+    <div class="fill" id="fill"></div>
+    <div class="content">
+      <div class="label">Tiempo restante</div><div class="big" id="slideT">–</div><div class="label" id="slideB"></div>
+    </div>
+  </div>
+</div>
+<div class="row">
+  <div class="card"><div class="label">Total</div><div class="big" id="total">–</div><div class="label" id="totalB"></div></div>
+  <div class="card"><div class="label">Desvío</div><div class="big" id="behind">–</div></div>
+</div>
+<div class="row">
+  <button onclick="send({cmd:'prev'})">◀ Anterior</button>
+  <button class="primary" onclick="send({cmd:'next'})">Siguiente ▶</button>
+</div>
+<pre id="notes"></pre>
+<script>
+const token = new URLSearchParams(location.search).get('token') || '';
+const $ = id => document.getElementById(id);
+let ws;
+const mmss = s => { const a = Math.abs(Math.round(s)); return (s < 0 ? '-' : '') + Math.floor(a/60) + ':' + String(a%60).padStart(2,'0'); };
+function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws?token=${encodeURIComponent(token)}`);
+  ws.onopen = () => $('status').textContent = 'Conectado';
+  ws.onclose = () => { $('status').textContent = 'Desconectado, reintentando…'; setTimeout(connect, 1500); };
+  ws.onmessage = e => {
+    const s = JSON.parse(e.data);
+    $('status').textContent = !s.connected ? 'PowerPoint no está abierto'
+      : !s.inSlideShow ? `${s.presentation} — sin presentación en curso` : s.presentation;
+    $('title').textContent = s.title || '—';
+    $('slide').textContent = s.slide ? `${s.slide} / ${s.slideCount}` : '–';
+    // Cuenta atrás: tiempo previsto - tiempo en pantalla (negativo si te pasas).
+    // Sin tiempo previsto para la diapositiva, se muestra el tiempo transcurrido.
+    const hasBudget = s.slideBudget > 0;
+    $('slideT').textContent = hasBudget ? mmss(s.slideBudget - s.slideElapsed) : mmss(s.slideElapsed);
+    $('slideT').className = 'big ' + (s.slideOvertime ? 'bad' : '');
+    $('slideB').textContent = hasBudget ? 'previsto ' + mmss(s.slideBudget) : 'sin tiempo previsto';
+    $('fill').style.width = hasBudget ? Math.min(100, s.slideElapsed / s.slideBudget * 100) + '%' : '0';
+    $('slideCard').classList.toggle('over', s.slideOvertime);
+    $('total').textContent = mmss(s.totalElapsed);
+    $('totalB').textContent = s.totalBudget ? 'previsto ' + mmss(s.totalBudget) : '';
+    $('behind').textContent = (s.behindSeconds > 0 ? '+' : '') + mmss(s.behindSeconds);
+    $('behind').className = 'big ' + (s.behindSeconds > 5 ? 'bad' : s.behindSeconds < -5 ? 'ok' : '');
+    $('notes').textContent = s.notes;
+  };
+}
+connect();
+</script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+bin/
+obj/
+.vs/
+server.log
+server.log.err
