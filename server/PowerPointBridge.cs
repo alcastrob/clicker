@@ -12,7 +12,10 @@ public sealed record PptSnapshot(
     int Count,
     string Title,
     string Notes,
-    string[] AllNotes)
+    string[] AllNotes,
+    string Key = "",
+    int ClickIndex = 0,
+    int ClickCount = 0)
 {
     public static readonly PptSnapshot Disconnected =
         new(false, false, "", 0, 0, "", "", Array.Empty<string>());
@@ -70,10 +73,12 @@ public sealed class PowerPointBridge : IDisposable
                 {
                     _snapshot = PptSnapshot.Disconnected;
                     _commands.Clear();
+                    while (_exports.TryDequeue(out var lost)) lost.Tcs.TrySetResult(null);
                 }
                 else
                 {
                     Drain(app);
+                    DrainExports(app);
                     _snapshot = Read(app, ref notesKey, ref allNotes);
                 }
             }
@@ -122,6 +127,166 @@ public sealed class PowerPointBridge : IDisposable
             catch (COMException ex)
             {
                 Console.Error.WriteLine($"[ppt] comando '{c.Cmd}' falló: {ex.Message}");
+            }
+        }
+    }
+
+    // ------------------------------------------------------ miniaturas de diapositivas
+
+    private readonly ConcurrentQueue<(int Slide, int Click, TaskCompletionSource<string?> Tcs)> _exports = new();
+    private string _copyKey = "";
+    private string _copyPath = "";
+    private static readonly string CacheRoot = Path.Combine(Path.GetTempPath(), "clicker-slides");
+
+    /// <summary>Identificador corto y estable de una presentación (para cachés y URLs).</summary>
+    public static string Hash(string key) =>
+        Convert.ToHexString(System.Security.Cryptography.SHA1.HashData(System.Text.Encoding.UTF8.GetBytes(key)))[..8];
+
+    /// <summary>Borra miniaturas de ejecuciones anteriores (la presentación pudo cambiar).</summary>
+    public static void ClearCache()
+    {
+        try { if (Directory.Exists(CacheRoot)) Directory.Delete(CacheRoot, true); }
+        catch (IOException) { }
+    }
+
+    /// <summary>
+    /// Exporta la diapositiva a PNG (con caché) tal como se vería tras <paramref name="click"/> clics
+    /// de animación (0 = al llegar a ella). Devuelve la ruta, o null si no se pudo.
+    /// </summary>
+    public Task<string?> ExportSlideAsync(int slide, int click = 0)
+    {
+        var tcs = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _exports.Enqueue((slide, Math.Max(0, click), tcs));
+        return tcs.Task;
+    }
+
+    /// <summary>
+    /// Copia de la presentación (SaveCopyAs) sobre la que se oculta lo que aún no ha aparecido.
+    /// Así nunca se toca la presentación en pantalla.
+    /// </summary>
+    private string EnsureCopy(dynamic pres, string key)
+    {
+        if (_copyKey == key && File.Exists(_copyPath)) return _copyPath;
+        string dir = Path.Combine(CacheRoot, Hash(key));
+        Directory.CreateDirectory(dir);
+        string path = Path.Combine(dir, "deck.pptx");
+        pres.SaveCopyAs(path);
+        _copyKey = key;
+        _copyPath = path;
+        return path;
+    }
+
+    private void ExportWithState(dynamic app, dynamic pres, string key, int slideIdx, int click, string file, int px, int py)
+    {
+        string copyPath = EnsureCopy(pres, key);
+        dynamic copy = app.Presentations.Open(copyPath, -1 /*solo lectura*/, 0 /*con título*/, 0 /*sin ventana*/);
+        try
+        {
+            dynamic slide = copy.Slides.Item(slideIdx);
+            ApplyClickState(slide, click);
+            slide.Export(file, "PNG", px, py);
+        }
+        finally
+        {
+            try { copy.Saved = -1; copy.Close(); } catch (COMException) { }
+        }
+    }
+
+    /// <summary>
+    /// Deja la diapositiva (de la copia) como se vería tras <paramref name="clicks"/> clics:
+    /// oculta lo que aún no ha entrado y lo que ya ha salido. Solo efectos de entrada y salida
+    /// (tipos 1–53); los de énfasis y trayectorias no cambian la visibilidad.
+    /// </summary>
+    private static void ApplyClickState(dynamic slide, int clicks)
+    {
+        dynamic seq = slide.TimeLine.MainSequence;
+        int n = (int)seq.Count;
+        var effects = new List<(dynamic Shape, int Id, int Para, bool Entrance, int ClickNo)>();
+        int click = 0;
+        for (int i = 1; i <= n; i++)
+        {
+            try
+            {
+                dynamic e = seq.Item(i);
+                if ((int)e.Timing.TriggerType == 1) click++;   // 1 = al hacer clic
+                int type = (int)e.EffectType;
+                if (type < 1 || type > 53) continue;
+                dynamic shape = e.Shape;
+
+                // Effect.Paragraph falla en formas sin texto (imágenes, gráficos...): efecto sobre toda la forma.
+                int para = 0;
+                try { para = (int)e.Paragraph; } catch (COMException) { }
+
+                effects.Add((shape, (int)shape.Id, para, (int)e.Exit == 0, click));
+            }
+            catch (Exception ex) when (ex is COMException or Microsoft.CSharp.RuntimeBinder.RuntimeBinderException)
+            {
+                Console.Error.WriteLine($"[ppt] efecto {i} ignorado: {ex.Message}");
+            }
+        }
+
+        // Visibilidad inicial: lo que tiene efecto de entrada empieza oculto.
+        var visible = new Dictionary<(int, int), bool>();
+        var targets = new Dictionary<(int, int), dynamic>();
+        foreach (var e in effects)
+        {
+            var k = (e.Id, e.Para);
+            if (!visible.ContainsKey(k)) { visible[k] = !e.Entrance; targets[k] = e.Shape; }
+        }
+        foreach (var e in effects)
+            if (e.ClickNo <= clicks) visible[(e.Id, e.Para)] = e.Entrance;
+
+        foreach (var (k, isVisible) in visible)
+        {
+            if (isVisible) continue;
+            dynamic shape = targets[k];
+            try
+            {
+                if (k.Item2 == 0) shape.Visible = 0;
+                else
+                {
+                    dynamic para = shape.TextFrame2.TextRange.Paragraphs(k.Item2, 1);
+                    para.Font.Fill.Transparency = 1f;           // conserva el hueco de la línea
+                    para.ParagraphFormat.Bullet.Visible = 0;
+                }
+            }
+            catch (Exception ex) when (ex is COMException or Microsoft.CSharp.RuntimeBinder.RuntimeBinderException) { }
+        }
+    }
+
+    private void DrainExports(dynamic app)
+    {
+        while (_exports.TryDequeue(out var req))
+        {
+            try
+            {
+                dynamic pres = (int)app.SlideShowWindows.Count > 0
+                    ? app.SlideShowWindows.Item(1).Presentation
+                    : app.ActivePresentation;
+                int count = (int)pres.Slides.Count;
+                if (req.Slide < 1 || req.Slide > count) { req.Tcs.SetResult(null); continue; }
+
+                string key = $"{(string)pres.FullName}|{count}";
+                string dir = Path.Combine(CacheRoot, Hash(key));
+                Directory.CreateDirectory(dir);
+                string file = Path.Combine(dir, $"{req.Slide}_{req.Click}.png");
+                if (!File.Exists(file))
+                {
+                    const int width = 640;
+                    double ratio = (double)pres.PageSetup.SlideHeight / (double)pres.PageSetup.SlideWidth;
+                    int height = (int)Math.Round(width * ratio);
+                    dynamic live = pres.Slides.Item(req.Slide);
+                    if ((int)live.TimeLine.MainSequence.Count == 0)
+                        live.Export(file, "PNG", width, height);          // sin animaciones: exportación directa
+                    else
+                        ExportWithState(app, pres, key, req.Slide, req.Click, file, width, height);
+                }
+                req.Tcs.SetResult(File.Exists(file) ? file : null);
+            }
+            catch (Exception e)
+            {
+                Console.Error.WriteLine($"[ppt] exportar diapositiva {req.Slide} falló: {e.Message}");
+                req.Tcs.TrySetResult(null);
             }
         }
     }
@@ -201,7 +366,15 @@ public sealed class PowerPointBridge : IDisposable
         }
 
         dynamic slide = pres.Slides.Item(idx);
-        return new PptSnapshot(true, inShow, name, idx, count, TitleOf(slide), NotesOf(slide), allNotes);
+        int clickIndex = 0, clickCount = 0;
+        if (inShow)
+        {
+            try { clickIndex = (int)view!.GetClickIndex(); clickCount = (int)view!.GetClickCount(); }
+            catch (COMException) { }
+        }
+
+        return new PptSnapshot(true, inShow, name, idx, count, TitleOf(slide), NotesOf(slide), allNotes,
+            key, clickIndex, clickCount);
     }
 
     private static string TitleOf(dynamic slide)

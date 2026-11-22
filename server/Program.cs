@@ -24,16 +24,31 @@ var clients = new ConcurrentDictionary<Guid, WebSocket>();
 int totalSeconds = 0; // duración total prevista; 0 = solo etiquetas [m:ss] de las notas
 var json = new JsonSerializerOptions(JsonSerializerDefaults.Web);
 
+bool TokenOk(HttpContext ctx) =>
+    CryptographicOperations.FixedTimeEquals(
+        Encoding.UTF8.GetBytes(ctx.Request.Query["token"].ToString()), Encoding.UTF8.GetBytes(token));
+
+PowerPointBridge.ClearCache();
+
+// Miniatura de una diapositiva (PNG), p. ej. /slide/3.png?token=...
+app.MapGet("/slide/{n:int}.png", async (int n, HttpContext ctx) =>
+{
+    if (!TokenOk(ctx)) return Results.StatusCode(401);
+    try
+    {
+        int.TryParse(ctx.Request.Query["click"], out var click);
+        var path = await bridge.ExportSlideAsync(n, click).WaitAsync(TimeSpan.FromSeconds(8));
+        if (path is null) return Results.NotFound();
+        ctx.Response.Headers.CacheControl = "private, max-age=3600"; // la URL lleva el id de la presentación
+        return Results.File(path, "image/png");
+    }
+    catch (TimeoutException) { return Results.StatusCode(504); }
+});
+
 app.Map("/ws", async ctx =>
 {
     if (!ctx.WebSockets.IsWebSocketRequest) { ctx.Response.StatusCode = 400; return; }
-
-    var given = Encoding.UTF8.GetBytes(ctx.Request.Query["token"].ToString());
-    if (!CryptographicOperations.FixedTimeEquals(given, Encoding.UTF8.GetBytes(token)))
-    {
-        ctx.Response.StatusCode = 401;
-        return;
-    }
+    if (!TokenOk(ctx)) { ctx.Response.StatusCode = 401; return; }
 
     using var ws = await ctx.WebSockets.AcceptWebSocketAsync();
     var id = Guid.NewGuid();
@@ -86,7 +101,7 @@ _ = Task.Run(async () =>
     while (!ct.IsCancellationRequested)
     {
         var ppt = bridge.Snapshot;
-        var t = timer.Update(ppt.InShow, ppt.Slide);
+        var t = timer.Update(ppt.InShow, ppt.Slide, ppt.Key);
 
         if (!ReferenceEquals(budgetsFor, ppt.AllNotes) || budgetsTotal != totalSeconds)
         {
@@ -99,6 +114,7 @@ _ = Task.Run(async () =>
         int plannedBefore = 0;
         for (int i = 0; i < ppt.Slide - 1 && i < budgets.Length; i++) plannedBefore += budgets[i];
         double slideElapsed = t.PerSlide.GetValueOrDefault(ppt.Slide);
+        bool hasClicks = ppt.InShow && ppt.ClickIndex < ppt.ClickCount;
 
         var state = new
         {
@@ -107,6 +123,12 @@ _ = Task.Run(async () =>
             presentation = ppt.Presentation,
             slide = ppt.Slide,
             slideCount = ppt.Count,
+            // Vista previa de lo que saldrá al pulsar "siguiente": si a la diapositiva actual le quedan
+            // clics de animación, ella misma tras ese clic; si no, la siguiente. 0 = no hay nada después.
+            previewSlide = hasClicks ? ppt.Slide : (ppt.Slide > 0 && ppt.Slide < ppt.Count ? ppt.Slide + 1 : 0),
+            previewClick = hasClicks ? ppt.ClickIndex + 1 : 0,
+            previewIsSameSlide = hasClicks,
+            deckId = PowerPointBridge.Hash(ppt.Key),
             title = ppt.Title,
             notes = Budgets.ForDisplay(ppt.Notes),
             running = t.Running,

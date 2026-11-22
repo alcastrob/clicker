@@ -13,7 +13,10 @@ public sealed class SessionTimer
 {
     private readonly object _lock = new();
     private readonly Dictionary<int, double> _per = new();
-    private bool _running, _manualPaused, _wasInShow;
+    private static readonly TimeSpan EndGrace = TimeSpan.FromSeconds(3);
+    private bool _running, _active;
+    private DateTime? _notInShowSince;
+    private string _deckKey = "";
     private double _total;
     private int _slide;
     private DateTime _last = DateTime.UtcNow;
@@ -30,23 +33,61 @@ public sealed class SessionTimer
         _last = now;
     }
 
-    public TimerSnapshot Update(bool inShow, int slide)
+    /// <summary>
+    /// Actualiza el cronómetro con el estado actual de PowerPoint.
+    /// Al empezar una presentación el reloj arranca; si empieza desde la diapositiva 1 (o es otra
+    /// presentación) se pone a cero, y si empieza desde otra se reanuda lo acumulado.
+    /// Al terminarla se detiene, pero solo tras <see cref="EndGrace"/> sin presentación, para que un
+    /// fallo momentáneo de lectura no pare el reloj en mitad de la charla.
+    /// </summary>
+    public TimerSnapshot Update(bool inShow, int slide, string deckKey)
     {
         lock (_lock)
         {
             Tick();
-            _slide = slide;
-            if (inShow && !_running && !_manualPaused && _total == 0) _running = true;
-            // Al terminar la presentación el reloj se detiene (se puede reanudar a mano).
-            if (_wasInShow && !inShow) { _running = false; _manualPaused = true; }
-            _wasInShow = inShow;
+            if (slide > 0) _slide = slide;   // sin presentación se conserva la última diapositiva
+            var now = DateTime.UtcNow;
+
+            if (inShow)
+            {
+                _notInShowSince = null;
+                if (!_active)
+                {
+                    _active = true;
+                    if (slide == 1 || deckKey != _deckKey)
+                    {
+                        _total = 0;
+                        _per.Clear();
+                    }
+                    _deckKey = deckKey;
+                    _running = true;
+                }
+            }
+            else if (_active)
+            {
+                _notInShowSince ??= now;
+                var away = now - _notInShowSince.Value;
+                if (away >= EndGrace)
+                {
+                    // El tiempo de espera no era charla: se descuenta del total y de la diapositiva.
+                    double s = away.TotalSeconds;
+                    if (_running)
+                    {
+                        _total = Math.Max(0, _total - s);
+                        if (_slide > 0) _per[_slide] = Math.Max(0, _per.GetValueOrDefault(_slide) - s);
+                    }
+                    _active = false;
+                    _running = false;
+                }
+            }
+
             return new TimerSnapshot(_running, _total, new Dictionary<int, double>(_per));
         }
     }
 
-    public void Start()  { lock (_lock) { Tick(); _running = true;  _manualPaused = false; } }
-    public void Pause()  { lock (_lock) { Tick(); _running = false; _manualPaused = true; } }
-    public void Reset()  { lock (_lock) { _running = false; _manualPaused = false; _total = 0; _per.Clear(); _last = DateTime.UtcNow; } }
+    public void Start()  { lock (_lock) { Tick(); _running = true; } }
+    public void Pause()  { lock (_lock) { Tick(); _running = false; } }
+    public void Reset()  { lock (_lock) { _running = false; _active = false; _notInShowSince = null; _total = 0; _per.Clear(); _last = DateTime.UtcNow; } }
 }
 
 public static partial class Budgets

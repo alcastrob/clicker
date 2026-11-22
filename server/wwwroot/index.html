@@ -19,6 +19,9 @@
   button { flex:1; font-size:22px; padding:28px 0; border:0; border-radius:12px; background:var(--card); color:var(--fg); }
   button.primary { background:#1565c0; color:#fff; }
   .bad { color:var(--bad); } .ok { color:var(--ok); }
+  #nextCard { margin:12px 0; }
+  #nextImg { display:block; width:100%; margin-top:8px; border-radius:8px; }
+  #nextImg[hidden], #nextEnd[hidden] { display:none; }
   pre { white-space:pre-wrap; background:var(--card); border-radius:12px; padding:12px; }
 </style>
 </head>
@@ -41,6 +44,11 @@
 <div class="row">
   <button onclick="send({cmd:'prev'})">◀ Anterior</button>
   <button class="primary" onclick="send({cmd:'next'})">Siguiente ▶</button>
+</div>
+<div class="card" id="nextCard">
+  <div class="label" id="nextLabel">Siguiente diapositiva</div>
+  <img id="nextImg" alt="" hidden>
+  <div id="nextEnd" class="label" hidden>Última diapositiva</div>
 </div>
 <pre id="notes"></pre>
 <script>
@@ -72,6 +80,18 @@ function connect() {
     $('behind').textContent = (s.behindSeconds > 0 ? '+' : '') + mmss(s.behindSeconds);
     $('behind').className = 'big ' + (s.behindSeconds > 5 ? 'bad' : s.behindSeconds < -5 ? 'ok' : '');
     $('notes').textContent = s.notes;
+
+    // Miniatura de la siguiente diapositiva (solo se recarga si cambia).
+    const img = $('nextImg');
+    $('nextLabel').textContent = s.previewIsSameSlide ? 'Tras el siguiente clic' : 'Siguiente diapositiva';
+    if (s.previewSlide > 0) {
+      const src = `/slide/${s.previewSlide}.png?token=${encodeURIComponent(token)}&click=${s.previewClick}&k=${s.deckId}`;
+      if (img.dataset.src !== src) { img.dataset.src = src; img.src = src; }
+      img.hidden = false; $('nextEnd').hidden = true;
+    } else {
+      img.hidden = true; delete img.dataset.src;
+      $('nextEnd').hidden = !s.inSlideShow;
+    }
   };
 }
 connect();
